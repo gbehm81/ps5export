@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+FTP-Sync-Skript: TrueNAS → PS5 (FTP auf Port 2121)
+- Überträgt rekursiv alle Dateien/Ordner aus /mnt/.ix-apps/app_mounts/jdownloader2/downloads/transfer
+- Ziel: ftp://root:root@192.168.2.55:2121/data/homebrew/
+- Fortschrittsanzeige (Datei-für-Datei mit %)
+- tmux-freundlich (kein Clear, kein interaktives Warten)
+
+Speicherort: /root/transfer.py
+"""
+
+import os
+import sys
+import time
+from ftplib import FTP
+from pathlib import Path
+
+# ===== KONFIGURATION =====
+SOURCE_DIR = "/mnt/Frankenpool/SMB/Transfer"
+FTP_HOST = "192.168.2.55"
+FTP_PORT = 2121
+FTP_USER = "root"
+FTP_PASS = "root"
+REMOTE_BASE_DIR = "/data/homebrew"  # Zielordner auf der PS5
+
+# ===== HELPER =====
+def log(msg: str):
+    """Einfache Log-Ausgabe (stdout)."""
+    print(msg, flush=True)
+
+def get_dir_size(path: Path) -> int:
+    """Gesamtgröße eines Verzeichnisses in Bytes."""
+    total = 0
+    for entry in path.rglob("*"):
+        if entry.is_file():
+            total += entry.stat().st_size
+    return total
+
+def format_size(size_bytes: int) -> str:
+    """Bytes in lesbare Größe umwandeln."""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+def upload_file_with_progress(ftp: FTP, local_path: Path, remote_path: str, total_bytes: int, already_transferred: int):
+    """Lädt eine Datei hoch und zeigt Fortschritt (relativ zum Gesamttransfer)."""
+    file_size = local_path.stat().st_size
+    if file_size == 0:
+        # Leere Datei einfach hochladen
+        with open(local_path, "rb") as f:
+            ftp.storbinary(f"STOR {remote_path}", f)
+        return file_size
+
+    transferred_in_file = 0
+    last_percent = -1
+
+    def callback(block):
+        nonlocal transferred_in_file, last_percent
+        block_size = len(block)
+        transferred_in_file += block_size
+
+        # Gesamtfortschritt
+        overall_transferred = already_transferred + transferred_in_file
+        percent = int(overall_transferred * 100 / total_bytes) if total_bytes > 0 else 100
+
+        if percent != last_percent:
+            # Einzeilige Fortschrittsanzeige (für tmux gut lesbar)
+            sys.stdout.write(f"\rFortschritt: {percent:3d}% | {format_size(overall_transferred)} / {format_size(total_bytes)} | Datei: {remote_path}")
+            sys.stdout.flush()
+            last_percent = percent
+
+    with open(local_path, "rb") as f:
+        ftp.storbinary(f"STOR {remote_path}", f, callback=callback)
+
+    # Zeile abschließen
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return file_size
+
+def ensure_remote_dir(ftp: FTP, remote_dir: str):
+    """Stellt sicher, dass ein Remote-Verzeichnis existiert (rekursiv)."""
+    parts = [p for p in remote_dir.split("/") if p]
+    current = ""
+    for part in parts:
+        current += "/" + part
+        try:
+            ftp.cwd(current)
+        except Exception:
+            # Verzeichnis existiert nicht → erstellen
+            ftp.mkd(current)
+
+def sync_recursive(ftp: FTP, local_root: Path, remote_root: str):
+    """Rekursiver Sync: local_root → remote_root."""
+    total_bytes = get_dir_size(local_root)
+    log(f"Gesamtgröße: {format_size(total_bytes)}")
+    log(f"Quelle: {local_root}")
+    log(f"Ziel (FTP): {FTP_HOST}:{FTP_PORT}{remote_root}")
+    log("Starte Transfer...\n")
+
+    already_transferred = 0
+    files_count = 0
+
+    for local_path in sorted(local_root.rglob("*")):
+        if local_path.is_file():
+            # Relativer Pfad vom Root
+            rel_path = local_path.relative_to(local_root)
+            remote_file_path = remote_root.rstrip("/") + "/" + str(rel_path)
+            remote_dir = str(Path(remote_file_path).parent)
+
+            # Verzeichnisstruktur anlegen
+            ensure_remote_dir(ftp, remote_dir)
+
+            # Datei hochladen
+            try:
+                uploaded = upload_file_with_progress(
+                    ftp,
+                    local_path,
+                    remote_file_path,
+                    total_bytes,
+                    already_transferred
+                )
+                already_transferred += uploaded
+                files_count += 1
+            except Exception as e:
+                log(f"\nFEHLER bei {local_path}: {e}")
+
+    log(f"\nFertig! {files_count} Dateien übertragen.")
+
+def main():
+    if not os.path.isdir(SOURCE_DIR):
+        log(f"FEHLER: Quellverzeichnis existiert nicht: {SOURCE_DIR}")
+        sys.exit(1)
+
+    log("Verbinde mit FTP-Server...")
+    ftp = FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
+    ftp.login(FTP_USER, FTP_PASS)
+    log("Verbunden.\n")
+
+    try:
+        # In Remote-Basisverzeichnis wechseln (wird bei ensure_remote_dir erstellt falls nötig)
+        try:
+            ftp.cwd(REMOTE_BASE_DIR)
+        except Exception:
+            # Verzeichnis existiert nicht → erstellen
+            try:
+                ftp.mkd(REMOTE_BASE_DIR)
+                ftp.cwd(REMOTE_BASE_DIR)
+            except Exception as e:
+                log(f"Konnte Remote-Basisverzeichnis nicht erstellen: {e}")
+                sys.exit(1)
+
+        local_root = Path(SOURCE_DIR)
+        sync_recursive(ftp, local_root, REMOTE_BASE_DIR)
+    finally:
+        ftp.quit()
+        log("FTP-Verbindung geschlossen.")
+
+if __name__ == "__main__":
+    main()
